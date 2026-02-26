@@ -83,15 +83,26 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c // Wait for Ctrl+C
-		fmt.Println("\n\nStopping... Cleaning up Firewall rules...")
-		reporter := &TextReporter{}
-		result.Summary()
-		output = reporter.Generate(result)
-		if *outputF != "" {
-			os.WriteFile(*outputF, []byte(output), 0644)
+		if runtime.GOOS == "windows" {
+			fmt.Println("\n\nStopping... Cleaning up Firewall rules...")
+			reporter := &TextReporter{}
+			result.Summary()
+			output = reporter.Generate(result)
+			if *outputF != "" {
+				os.WriteFile(*outputF, []byte(output), 0644)
+			}
+			cleanupWindowsFirewall()
+			os.Exit(0)
+		} else {
+			fmt.Println("\n\nStopping...")
+			reporter := &TextReporter{}
+			result.Summary()
+			output = reporter.Generate(result)
+			if *outputF != "" {
+				os.WriteFile(*outputF, []byte(output), 0644)
+			}
+			os.Exit(0)
 		}
-		cleanupWindowsFirewall()
-		os.Exit(0)
 	}()
 
 	if *checkMTRF && *pingTestF {
@@ -109,7 +120,7 @@ func main() {
 	if *pingTestF {
 		count := *packetCountF
 		if *packetCountF == 0 {
-			count = 4
+			count = 999999
 		}
 		pingTest(target, count, result)
 	}
@@ -165,11 +176,13 @@ func mtr(target string, count int, result *AnalysisResult) {
 				break
 			}
 
+			id := (os.Getpid() + 717) & 0xffff
 			p.SetTTL(ttl)
 			msg := icmp.Message{
 				Type: ipv4.ICMPTypeEcho, Code: 0,
 				Body: &icmp.Echo{
-					ID: 717, Seq: ttl,
+					ID:   id,
+					Seq:  ttl,
 					Data: []byte("NETTEST"),
 				},
 			}
@@ -184,31 +197,58 @@ func mtr(target string, count int, result *AnalysisResult) {
 				continue
 			}
 
-			p.SetReadDeadline(time.Now().Add(1 * time.Second))
-
-			replyBuf := make([]byte, 1500)
-			n, _, peer, err := p.ReadFrom(replyBuf)
-
-			duration := time.Since(start)
-
-			if err != nil {
-				fmt.Printf("%d: * (Timeout)\n", ttl)
-			} else {
-				result.Hops[ttl-1].Received++
-				result.Hops[ttl-1].Latencies = append(result.Hops[ttl-1].Latencies, duration)
-
-				rm, _ := icmp.ParseMessage(ipv4.ICMPTypeEcho.Protocol(), replyBuf[:n])
-
-				switch rm.Type {
-				case ipv4.ICMPTypeTimeExceeded:
-					// router - +hop
-					fmt.Printf("%d: %v  %v\n", ttl, peer, duration)
+			deadline := time.Now().Add(1 * time.Second)
+			p.SetReadDeadline(deadline)
+		readloop:
+			for time.Now().Before(deadline) {
+				replyBuf := make([]byte, 1500)
+				n, _, peer, err := p.ReadFrom(replyBuf)
+				if err != nil {
+					fmt.Printf("%d: * (Timeout)\n", ttl)
+					break
+				}
+				msg, err := icmp.ParseMessage(ipv4.ICMPTypeEcho.Protocol(), replyBuf[:n])
+				if err != nil {
+					fmt.Printf("%d: Parse Error: %v\n", ttl, err)
+					continue
+				}
+				switch msg.Type {
 				case ipv4.ICMPTypeEchoReply:
-					// destination
-					fmt.Printf("%d: %v  %v (DESTINATION)\n", ttl, peer, duration)
+					echo, ok := msg.Body.(*icmp.Echo)
+					if !ok {
+						continue
+					}
+					if echo.ID != id || echo.Seq != ttl {
+						continue
+					}
+					dstIP := net.ParseIP(target)
+					if dstIP == nil {
+						ips, err := net.LookupIP(target)
+						if err != nil {
+							continue
+						}
+						dstIP = ips[0]
+					}
+					if dstIP.String() != peer.String() {
+						continue
+					}
+
+					result.Hops[ttl-1].Latencies = append(result.Hops[ttl-1].Latencies, time.Since(start))
+					result.Hops[ttl-1].Received++
+					fmt.Printf("Reply from %s: time=%v\n", peer, time.Since(start))
 					destinationReached = true
+					break readloop
+
+				case ipv4.ICMPTypeTimeExceeded:
+					fmt.Printf("%d: %v  %v\n", ttl, peer, time.Since(start))
+					result.Hops[ttl-1].Received++
+					result.Hops[ttl-1].Latencies = append(result.Hops[ttl-1].Latencies, time.Since(start))
+					break readloop
+
 				default:
-					fmt.Printf("%d: ??? Type %v\n", ttl, rm.Type)
+					{
+						continue
+					}
 				}
 			}
 		}
@@ -297,11 +337,12 @@ func pingTest(target string, count int, result *AnalysisResult) {
 	}
 
 	for i := 0; i < count; i++ {
+		id := (os.Getpid() + 717) & 0xffff
 		msg := icmp.Message{
 			Type: ipv4.ICMPTypeEcho,
 			Code: 0,
 			Body: &icmp.Echo{
-				ID:   717,
+				ID:   id,
 				Seq:  i,
 				Data: []byte("NETTEST"),
 			},
@@ -322,23 +363,51 @@ func pingTest(target string, count int, result *AnalysisResult) {
 			continue
 		}
 
-		p.SetReadDeadline(time.Now().Add(1 * time.Second))
+		deadline := time.Now().Add(1 * time.Second)
+		p.SetReadDeadline(deadline)
+	readloop:
+		for time.Now().Before(deadline) {
+			replyBuf := make([]byte, 1500)
+			n, _, peer, err := p.ReadFrom(replyBuf)
+			if err != nil {
+				fmt.Printf("%d: * (Timeout)\n", i)
+				break
+			}
+			msg, err := icmp.ParseMessage(ipv4.ICMPTypeEcho.Protocol(), replyBuf[:n])
+			if err != nil {
+				fmt.Printf("%d: Parse Error: %v\n", i, err)
+				continue
+			}
+			switch msg.Type {
+			case ipv4.ICMPTypeEchoReply:
+				echo, ok := msg.Body.(*icmp.Echo)
+				if !ok {
+					continue
+				}
+				if echo.ID != id || echo.Seq != i {
+					continue
+				}
+				dstIP := net.ParseIP(target)
+				if dstIP == nil {
+					ips, err := net.LookupIP(target)
+					if err != nil {
+						continue
+					}
+					dstIP = ips[0]
+				}
+				if dstIP.String() != peer.String() {
+					continue
+				}
 
-		replyBuf := make([]byte, 1500)
-		n, _, peer, err := p.ReadFrom(replyBuf)
-
-		duration := time.Since(start)
-
-		if err != nil {
-			fmt.Printf("%d: * (Timeout)\n", i)
-		} else {
-			rm, _ := icmp.ParseMessage(ipv4.ICMPTypeEcho.Protocol(), replyBuf[:n])
-
-			if rm.Type == ipv4.ICMPTypeEchoReply {
+				result.Hops[0].Latencies = append(result.Hops[0].Latencies, time.Since(start))
 				result.Hops[0].Received++
-				result.Hops[0].Latencies = append(result.Hops[0].Latencies, duration)
+				fmt.Printf("Reply from %s: time=%v\n", peer, time.Since(start))
+				break readloop
 
-				fmt.Printf("Reply from %s: time=%v\n", peer, duration)
+			default:
+				{
+					continue
+				}
 			}
 		}
 	}
@@ -376,6 +445,7 @@ func CheckDNSSpoofing(target string, dnsServer string, result *AnalysisResult) {
 
 	if err != nil {
 		fmt.Println("Cant reach DNS server")
+		return
 	}
 
 	found := false
@@ -417,18 +487,25 @@ func parseTarget(target string) (string, string) {
 func (t *TextReporter) Generate(r *AnalysisResult) string {
 	return fmt.Sprintf(
 		"REPORT for %s\n"+
-			"--------------------------------------------------\n"+
+			"-----------------------------------------------------\n"+
 			"Time: %s\n"+
 			"Packet Loss: %.2f%%\n"+
 			"Avg Latency: %s\n"+
 			"Jitter:      %s\n"+
-			"--------------------------------------------------\n"+
+			"-----------------------------------------------------\n"+
 			"DNS Status:  %s\n"+
 			"System IP:   %s\n"+
-			"Trusted IP:  %s\n",
+			"Trusted IP:  %s\n"+
+			"-----------------------------------------------------\n"+
+			"OS: %s\n"+
+			"=====================================================\n"+
+			"==== Network Testing Tool created by karrigan.me ====\n"+
+			"======= https://github.com/KarriganMe/nettest =======\n"+
+			"=====================================================\n",
 		r.Target, r.Timestamp.Format(time.RFC822),
 		r.PacketLoss, r.AvgLatency, r.Jitter,
 		r.DNSStatus, r.SystemIP, r.TrustedIP,
+		runtime.GOOS,
 	)
 }
 
